@@ -5,6 +5,24 @@
  */
 package io.debezium.connector.mongodb.events;
 
+import com.mongodb.ServerAddress;
+import com.mongodb.ServerCursor;
+import com.mongodb.client.ChangeStreamIterable;
+import com.mongodb.client.MongoChangeStreamCursor;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import io.debezium.DebeziumException;
+import io.debezium.annotation.Immutable;
+import io.debezium.annotation.NotThreadSafe;
+import io.debezium.connector.mongodb.MongoDbConnector;
+import io.debezium.connector.mongodb.MongoDbTaskContext;
+import io.debezium.connector.mongodb.metrics.MongoDbStreamingChangeEventSourceMetrics;
+import io.debezium.util.Clock;
+import io.debezium.util.DelayStrategy;
+import io.debezium.util.Threads;
+import org.bson.BsonDocument;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Closeable;
 import java.time.Duration;
 import java.util.NoSuchElementException;
@@ -17,26 +35,6 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-
-import org.bson.BsonDocument;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.mongodb.ServerAddress;
-import com.mongodb.ServerCursor;
-import com.mongodb.client.ChangeStreamIterable;
-import com.mongodb.client.MongoChangeStreamCursor;
-import com.mongodb.client.model.changestream.ChangeStreamDocument;
-
-import io.debezium.DebeziumException;
-import io.debezium.annotation.Immutable;
-import io.debezium.annotation.NotThreadSafe;
-import io.debezium.connector.mongodb.MongoDbConnector;
-import io.debezium.connector.mongodb.MongoDbTaskContext;
-import io.debezium.connector.mongodb.metrics.MongoDbStreamingChangeEventSourceMetrics;
-import io.debezium.util.Clock;
-import io.debezium.util.DelayStrategy;
-import io.debezium.util.Threads;
 
 /**
  * An implementation of {@link  MongoChangeStreamCursor} which immediately starts consuming available events into a buffer.
@@ -127,6 +125,7 @@ public class BufferingChangeStreamCursor<TResult> implements MongoChangeStreamCu
         private final DelayStrategy throttler;
         private final AtomicBoolean running;
         private final AtomicReference<MongoChangeStreamCursor<ChangeStreamDocument<TResult>>> cursorRef;
+        private final AtomicReference<Throwable> fetcherErrorRef;
         private final MongoDbStreamingChangeEventSourceMetrics metrics;
         private final Clock clock;
         private int noMessageIterations = 0;
@@ -143,6 +142,7 @@ public class BufferingChangeStreamCursor<TResult> implements MongoChangeStreamCu
             this.throttler = throttler;
             this.running = new AtomicBoolean(false);
             this.cursorRef = new AtomicReference<>(null);
+            this.fetcherErrorRef = new AtomicReference<>(null);
             this.queue = new ConcurrentLinkedQueue<>();
         }
 
@@ -163,6 +163,24 @@ public class BufferingChangeStreamCursor<TResult> implements MongoChangeStreamCu
             return running.get();
         }
 
+        /**
+         * Indicates whether event fetching has failed due to some unexpected error
+         *
+         * @return true if failed, false otherwise
+         */
+        public boolean isFetcherFailed() {
+            return fetcherErrorRef.get() != null;
+        }
+
+        /**
+         * Returns fetching error if any.
+         *
+         * @return an error that caused fetching to fail, null otherwise
+         */
+        public Throwable getFetcherFailure() {
+            return fetcherErrorRef.get();
+        }
+
         @Override
         public void close() {
             running.set(false);
@@ -170,7 +188,12 @@ public class BufferingChangeStreamCursor<TResult> implements MongoChangeStreamCu
 
         public ResumableChangeStreamEvent<TResult> poll() {
             var event = queue.poll();
-            if (event != null) {
+            if (event == null) {
+                // let queue to drain before reporting fetcher's error
+                if (isFetcherFailed()) {
+                    throw new DebeziumException("Fetcher has failed", getFetcherFailure());
+                }
+            } else {
                 capacity.release();
             }
             return event;
@@ -199,7 +222,12 @@ public class BufferingChangeStreamCursor<TResult> implements MongoChangeStreamCu
                 fetchEvents(cursor);
             }
             catch (InterruptedException e) {
+                LOGGER.error("Fetcher thread interrupted", e);
                 throw new DebeziumException("Fetcher thread interrupted", e);
+            }
+            catch (Throwable e) {
+                LOGGER.error("Fetcher thread has failed", e);
+                fetcherErrorRef.set(e);
             }
             finally {
                 cursorRef.set(null);
@@ -290,6 +318,7 @@ public class BufferingChangeStreamCursor<TResult> implements MongoChangeStreamCu
     }
 
     public BufferingChangeStreamCursor<TResult> start() {
+        LOGGER.info("Fetcher submitted for execution: {} @ {}", fetcher, executor);
         executor.submit(fetcher);
         return this;
     }
